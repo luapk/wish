@@ -14,6 +14,13 @@ app = modal.App("cognitive-analyzer")
 
 job_store = modal.Dict.from_name("cognitive-analyzer-jobs", create_if_missing=True)
 
+# Lightweight image for the web endpoint functions (no GPU needed)
+endpoint_image = (
+    modal.Image.debian_slim(python_version="3.11")
+    .pip_install(["fastapi[standard]", "pydantic"])
+)
+
+# Heavy image for the GPU inference function
 image = (
     modal.Image.debian_slim(python_version="3.11")
     .apt_install(["ffmpeg"])
@@ -166,7 +173,7 @@ class AnalyzeRequest(BaseModel):
     video_url: str
 
 
-@app.function()
+@app.function(image=endpoint_image)
 @modal.fastapi_endpoint(method="POST", label="analyze")
 def start_analysis(req: AnalyzeRequest) -> dict:
     job_id = str(uuid.uuid4())
@@ -175,7 +182,7 @@ def start_analysis(req: AnalyzeRequest) -> dict:
     return {"job_id": job_id, "status": "queued"}
 
 
-@app.function()
+@app.function(image=endpoint_image)
 @modal.fastapi_endpoint(method="GET", label="status")
 def get_status(job_id: str) -> dict:
     from fastapi import HTTPException
