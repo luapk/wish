@@ -41,6 +41,8 @@ image = (
             # Download utilities
             "yt-dlp",
             "huggingface_hub",
+            # Required for web endpoints
+            "fastapi[standard]",
         ]
     )
 )
@@ -165,7 +167,7 @@ class AnalyzeRequest(BaseModel):
 
 
 @app.function()
-@modal.web_endpoint(method="POST", label="analyze")
+@modal.fastapi_endpoint(method="POST", label="analyze")
 def start_analysis(req: AnalyzeRequest) -> dict:
     job_id = str(uuid.uuid4())
     _set(job_id, {"status": "queued"})
@@ -174,7 +176,7 @@ def start_analysis(req: AnalyzeRequest) -> dict:
 
 
 @app.function()
-@modal.web_endpoint(method="GET", label="status")
+@modal.fastapi_endpoint(method="GET", label="status")
 def get_status(job_id: str) -> dict:
     from fastapi import HTTPException
     result = job_store.get(job_id)
