@@ -23,7 +23,7 @@ endpoint_image = (
 # Heavy image for the GPU inference function
 image = (
     modal.Image.debian_slim(python_version="3.11")
-    .apt_install(["ffmpeg"])
+    .apt_install(["ffmpeg", "git"])
     .pip_install(
         [
             # TribeV2 — installed from source (no PyPI package)
