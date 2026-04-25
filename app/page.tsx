@@ -10,7 +10,8 @@ import type { AppPhase, AnalysisResult, JobStage, AudienceId } from '@/lib/types
 
 export default function Home() {
   const [state, setState] = useState<AppPhase>({ phase: 'idle' });
-  const pollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const pollingRef  = useRef<ReturnType<typeof setInterval> | null>(null);
+  const videoUrlRef = useRef<string>('');
 
   useEffect(() => () => { if (pollingRef.current) clearInterval(pollingRef.current); }, []);
 
@@ -40,7 +41,8 @@ export default function Home() {
   };
 
   const startAnalysis = async (videoUrl: string, audience: AudienceId) => {
-    setState({ phase: 'analyzing', stage: 'queued', jobId: '' });
+    videoUrlRef.current = videoUrl;
+    setState({ phase: 'analyzing', stage: 'queued', jobId: '', videoUrl });
     try {
       const res = await fetch('/api/analyze', {
         method: 'POST',
@@ -49,7 +51,7 @@ export default function Home() {
       });
       if (!res.ok) throw new Error('Failed to start analysis.');
       const { job_id } = await res.json();
-      setState({ phase: 'analyzing', stage: 'queued', jobId: job_id });
+      setState({ phase: 'analyzing', stage: 'queued', jobId: job_id, videoUrl });
       startPolling(job_id);
     } catch (err) {
       setState({ phase: 'error', message: (err as Error).message });
@@ -64,13 +66,15 @@ export default function Home() {
         const status = await res.json();
         if (status.status === 'complete') {
           clearInterval(pollingRef.current!);
-          setState({ phase: 'results', data: status.data as AnalysisResult });
+          setState({ phase: 'results', data: status.data as AnalysisResult, videoUrl: videoUrlRef.current });
         } else if (status.status === 'error') {
           clearInterval(pollingRef.current!);
           setState({ phase: 'error', message: status.error || 'Analysis failed.' });
         } else {
           setState((prev) =>
-            prev.phase === 'analyzing' ? { ...prev, stage: status.status as JobStage } : prev
+            prev.phase === 'analyzing'
+              ? { ...prev, stage: status.status as JobStage }
+              : prev
           );
         }
       } catch { /* transient — keep polling */ }
@@ -131,7 +135,7 @@ export default function Home() {
 
           {state.phase === 'results' && (
             <motion.div key="results" initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -16 }} transition={{ duration: 0.3 }}>
-              <ResultsDashboard data={state.data} onReset={handleReset} />
+              <ResultsDashboard data={state.data} videoUrl={state.videoUrl} onReset={handleReset} />
             </motion.div>
           )}
 
