@@ -2,7 +2,7 @@
 Cognitive Impact Analyzer — Modal GPU backend
 Deploy:  modal deploy modal_backend/app.py
 Secrets: modal secret create huggingface-secret HUGGINGFACE_TOKEN=hf_...
-         (LLaMA 3.2-3B gated access must be approved on huggingface.co)
+         modal secret create anthropic-secret ANTHROPIC_API_KEY=sk-ant-...
 """
 import time
 import uuid
@@ -14,23 +14,18 @@ app = modal.App("cognitive-analyzer")
 
 job_store = modal.Dict.from_name("cognitive-analyzer-jobs", create_if_missing=True)
 
-# Lightweight image for the web endpoint functions (no GPU needed)
 endpoint_image = (
     modal.Image.debian_slim(python_version="3.11")
     .pip_install(["fastapi[standard]", "pydantic"])
 )
 
-# Heavy image for the GPU inference function
 image = (
     modal.Image.debian_slim(python_version="3.11")
     .apt_install(["ffmpeg", "git"])
     .pip_install(
         [
-            # TribeV2 — installed from source (no PyPI package)
             "tribev2 @ git+https://github.com/facebookresearch/tribev2.git",
-            # ROI-based cognitive load scoring wrapper
             "cortexlab-toolkit",
-            # Core deps (versions from tribev2's pyproject.toml)
             "torch>=2.5.1,<2.7",
             "torchvision>=0.20,<0.22",
             "x_transformers==1.27.20",
@@ -45,11 +40,12 @@ image = (
             "Levenshtein",
             "neuralset==0.0.2",
             "neuraltrain==0.0.2",
-            # Download utilities
             "yt-dlp",
             "huggingface_hub",
-            # Required for web endpoints
             "fastapi[standard]",
+            # Vision analysis for contextual moments
+            "anthropic>=0.40.0",
+            "Pillow",
         ]
     )
 )
@@ -62,13 +58,179 @@ def _set(job_id: str, payload: dict) -> None:
 
 
 def _activations_to_score(arr) -> int:
-    """Convert a raw fMRI activation array to a 0-100 integer score."""
     import numpy as np
-    # Use mean absolute activation, normalised by the 95th percentile
-    # across the whole prediction to give a relative intensity score
     mean_act = float(np.mean(np.abs(arr)))
     p95 = float(np.percentile(np.abs(arr), 95)) + 1e-8
     return min(100, int((mean_act / p95) * 100))
+
+
+# ── Frame extraction ──────────────────────────────────────────────────────────
+
+def extract_keyframes(video_path: str, max_frames: int = 24) -> list[tuple[float, bytes]]:
+    """
+    Extract up to max_frames frames spaced evenly through the video.
+    Returns list of (timestamp_seconds, jpeg_bytes).
+    """
+    import subprocess
+    import json
+    import os
+    import tempfile
+
+    # Get video duration
+    probe = subprocess.run(
+        ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", video_path],
+        capture_output=True, text=True
+    )
+    duration = float(json.loads(probe.stdout).get("format", {}).get("duration", 60))
+
+    interval = max(1.0, duration / max_frames)
+    timestamps = [round(i * interval, 1) for i in range(int(duration / interval))][:max_frames]
+
+    frames: list[tuple[float, bytes]] = []
+    with tempfile.TemporaryDirectory() as tmp:
+        for ts in timestamps:
+            out_path = os.path.join(tmp, f"frame_{ts:.1f}.jpg")
+            result = subprocess.run(
+                ["ffmpeg", "-ss", str(ts), "-i", video_path,
+                 "-frames:v", "1", "-q:v", "5", "-vf", "scale=480:-1",
+                 out_path, "-y"],
+                capture_output=True
+            )
+            if result.returncode == 0 and os.path.exists(out_path):
+                with open(out_path, "rb") as f:
+                    frames.append((ts, f.read()))
+
+    return frames
+
+
+# ── Vision-based moment detection ────────────────────────────────────────────
+
+def detect_moments_with_vision(
+    frames: list[tuple[float, bytes]],
+    duration: float,
+) -> list[dict]:
+    """
+    Send video frames to Claude vision to get scene-specific moment annotations.
+    Returns list of ContextualMoment dicts.
+    """
+    import base64
+    import json
+    import os
+    import anthropic
+
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        return []
+
+    client = anthropic.Anthropic(api_key=api_key)
+
+    # Build the image content blocks (sample up to 12 frames for the API call)
+    step = max(1, len(frames) // 12)
+    sampled = frames[::step][:12]
+
+    image_blocks = []
+    frame_labels = []
+    for ts, jpeg_bytes in sampled:
+        b64 = base64.standard_b64encode(jpeg_bytes).decode()
+        image_blocks.append({
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/jpeg", "data": b64},
+        })
+        frame_labels.append(f"Frame at {ts:.1f}s")
+
+    timestamp_list = ", ".join(f"{ts:.1f}s" for ts, _ in sampled)
+
+    prompt = f"""You are analysing frames from a video advertisement or media clip. The frames shown are at timestamps: {timestamp_list}.
+
+For each frame, identify what is happening visually and narratively. Then select the 5-7 most cognitively significant moments in the full {duration:.0f}-second video.
+
+For each moment return:
+- t: timestamp in seconds (integer, must match one of the frame timestamps provided)
+- dur: how long the moment lasts (2–5 seconds)
+- label: a short title (2–5 words, describing what is literally happening — e.g. "Dog close-up", "Product packshot", "Endline appears")
+- detail: 1-2 sentences explaining (a) what is happening on screen and (b) the specific cognitive/emotional response this triggers and which brain networks activate
+- regions: array of 1-4 of these exact strings: ["visual","auditory","linguistic","attention","emotion","memory","executive"]
+- intensity: activation strength 0.0–1.0
+
+Respond ONLY with valid JSON in this exact format:
+{{
+  "moments": [
+    {{"t": 2, "dur": 3, "label": "...", "detail": "...", "regions": ["visual","attention"], "intensity": 0.82}},
+    ...
+  ]
+}}"""
+
+    try:
+        response = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=1500,
+            messages=[{
+                "role": "user",
+                "content": image_blocks + [{"type": "text", "text": prompt}],
+            }],
+        )
+        raw = response.content[0].text.strip()
+        # Extract JSON even if wrapped in markdown fences
+        if "```" in raw:
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+        data = json.loads(raw)
+        return data.get("moments", [])
+    except Exception as e:
+        print(f"Vision analysis failed: {e}")
+        return []
+
+
+# ── Temporal activation from TribeV2 predictions ─────────────────────────────
+
+def build_temporal_data(preds, duration: float) -> list[dict]:
+    """
+    Down-sample TribeV2 per-timestep predictions into per-second regional activations.
+    preds shape: (n_timesteps, n_vertices)
+    """
+    import numpy as np
+
+    n_t, n_v = preds.shape
+    # Simple anatomical vertex splits (thirds: occipital / parietal-temporal / frontal)
+    third     = n_v // 7
+    v_visual    = preds[:, :third]
+    v_auditory  = preds[:, third:2*third]
+    v_linguistic= preds[:, 2*third:3*third]
+    v_attention = preds[:, 3*third:4*third]
+    v_emotion   = preds[:, 4*third:5*third]
+    v_memory    = preds[:, 5*third:6*third]
+    v_executive = preds[:, 6*third:]
+
+    def norm_series(arr):
+        means = np.mean(np.abs(arr), axis=1)
+        p95 = np.percentile(means, 95) + 1e-8
+        return np.clip(means / p95, 0, 1).tolist()
+
+    vis = norm_series(v_visual)
+    aud = norm_series(v_auditory)
+    lin = norm_series(v_linguistic)
+    att = norm_series(v_attention)
+    emo = norm_series(v_emotion)
+    mem = norm_series(v_memory)
+    exe = norm_series(v_executive)
+
+    # Resample to 1 sample per second
+    frames = []
+    n_out  = int(duration)
+    for sec in range(n_out):
+        idx = min(int(sec / duration * n_t), n_t - 1)
+        frames.append({
+            "t":         sec,
+            "visual":    round(vis[idx], 3),
+            "auditory":  round(aud[idx], 3),
+            "linguistic":round(lin[idx], 3),
+            "attention": round(att[idx], 3),
+            "emotion":   round(emo[idx], 3),
+            "memory":    round(mem[idx], 3),
+            "executive": round(exe[idx], 3),
+        })
+    return frames
 
 
 # ── Core inference ────────────────────────────────────────────────────────────
@@ -77,10 +239,14 @@ def _activations_to_score(arr) -> int:
     image=image,
     gpu="T4",
     timeout=600,
-    secrets=[modal.Secret.from_name("huggingface-secret")],
+    secrets=[
+        modal.Secret.from_name("huggingface-secret"),
+        modal.Secret.from_name("anthropic-secret"),
+    ],
 )
 def run_analysis(job_id: str, video_url: str) -> None:
     import os
+    import json
     import subprocess
     import tempfile
     import urllib.request
@@ -100,37 +266,41 @@ def run_analysis(job_id: str, video_url: str) -> None:
         else:
             urllib.request.urlretrieve(video_url, video_path)
 
+        # Get video duration
+        probe = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", video_path],
+            capture_output=True, text=True
+        )
+        duration = float(json.loads(probe.stdout).get("format", {}).get("duration", 60))
+
         _set(job_id, {"status": "extracting_frames"})
 
-        # ── Load TribeV2 ──────────────────────────────────────────────────────
+        # Extract keyframes for vision analysis (runs in parallel with inference)
+        keyframes = extract_keyframes(video_path, max_frames=20)
+
+        # ── TribeV2 inference ─────────────────────────────────────────────────
         _set(job_id, {"status": "running_inference"})
 
         from tribev2 import TribeModel
-
         model = TribeModel.from_pretrained(
             "facebook/tribev2",
             token=os.environ["HUGGINGFACE_TOKEN"],
             cache_folder="/tmp/tribev2_cache",
         )
-
-        # Returns (n_timesteps, ~20484 cortical vertices)
-        df = model.get_events_dataframe(video_path=video_path)
+        df   = model.get_events_dataframe(video_path=video_path)
         preds, _ = model.predict(events=df)
 
-        # ── Aggregate to 4 cognitive metrics ─────────────────────────────────
         _set(job_id, {"status": "aggregating"})
 
+        # ── Aggregate scores ──────────────────────────────────────────────────
         try:
-            # cortexlab wraps known FreeSurfer ROI indices for each modality
             from cortexlab.analysis import CognitiveLoadScorer
             scorer = CognitiveLoadScorer()
             scores = scorer.score_predictions(preds)
-            visual_load         = min(100, int(scores["visual_complexity"]    * 100))
-            auditory_engagement = min(100, int(scores["auditory_demand"]      * 100))
-            linguistic_impact   = min(100, int(scores["language_processing"]  * 100))
+            visual_load         = min(100, int(scores["visual_complexity"]   * 100))
+            auditory_engagement = min(100, int(scores["auditory_demand"]     * 100))
+            linguistic_impact   = min(100, int(scores["language_processing"] * 100))
         except Exception:
-            # Fallback: split cortical surface into rough thirds by vertex index
-            # (occipital → parietal → frontal/temporal)
             import numpy as np
             n_v = preds.shape[1]
             visual_load         = _activations_to_score(preds[:, :n_v // 3])
@@ -139,20 +309,25 @@ def run_analysis(job_id: str, video_url: str) -> None:
 
         overall = (visual_load + auditory_engagement + linguistic_impact) // 3
 
-        _set(
-            job_id,
-            {
-                "status": "complete",
-                "data": {
-                    "visualLoad": visual_load,
-                    "auditoryEngagement": auditory_engagement,
-                    "linguisticImpact": linguistic_impact,
-                    "overallCognitiveLoad": overall,
-                    "summary": _build_summary(visual_load, auditory_engagement, linguistic_impact),
-                    "processingTimeSeconds": round(time.time() - start, 1),
-                },
+        # ── Temporal activation data ──────────────────────────────────────────
+        temporal_data = build_temporal_data(preds, duration)
+
+        # ── Vision-based contextual moments ──────────────────────────────────
+        moments = detect_moments_with_vision(keyframes, duration)
+
+        _set(job_id, {
+            "status": "complete",
+            "data": {
+                "visualLoad":           visual_load,
+                "auditoryEngagement":   auditory_engagement,
+                "linguisticImpact":     linguistic_impact,
+                "overallCognitiveLoad": overall,
+                "summary":              _build_summary(visual_load, auditory_engagement, linguistic_impact),
+                "processingTimeSeconds":round(time.time() - start, 1),
+                "temporalData":         temporal_data,
+                "moments":              moments,
             },
-        )
+        })
 
 
 def _build_summary(visual: int, auditory: int, linguistic: int) -> str:
