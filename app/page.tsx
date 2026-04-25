@@ -6,48 +6,40 @@ import { upload } from '@vercel/blob/client';
 import UploadZone from '@/components/UploadZone';
 import AnalyzingState from '@/components/AnalyzingState';
 import ResultsDashboard from '@/components/ResultsDashboard';
-import type { AppPhase, AnalysisResult, JobStage } from '@/lib/types';
+import type { AppPhase, AnalysisResult, JobStage, AudienceId } from '@/lib/types';
 
 export default function Home() {
   const [state, setState] = useState<AppPhase>({ phase: 'idle' });
   const pollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  useEffect(() => {
-    return () => {
-      if (pollingRef.current) clearInterval(pollingRef.current);
-    };
-  }, []);
+  useEffect(() => () => { if (pollingRef.current) clearInterval(pollingRef.current); }, []);
 
-  const handleFileUpload = async (file: File) => {
+  const handleFileUpload = async (file: File, audience: AudienceId) => {
     setState({ phase: 'uploading', progress: 0 });
-
     try {
       const blob = await upload(file.name, file, {
         access: 'public',
         handleUploadUrl: '/api/upload',
       });
-      await startAnalysis(blob.url);
+      await startAnalysis(blob.url, audience);
     } catch (err) {
       setState({ phase: 'error', message: (err as Error).message || 'Upload failed.' });
     }
   };
 
-  const handleUrlSubmit = async (url: string) => {
-    await startAnalysis(url);
+  const handleUrlSubmit = async (url: string, audience: AudienceId) => {
+    await startAnalysis(url, audience);
   };
 
-  const startAnalysis = async (videoUrl: string) => {
+  const startAnalysis = async (videoUrl: string, audience: AudienceId) => {
     setState({ phase: 'analyzing', stage: 'queued', jobId: '' });
-
     try {
       const res = await fetch('/api/analyze', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ videoUrl }),
+        body: JSON.stringify({ videoUrl, audience }),
       });
-
       if (!res.ok) throw new Error('Failed to start analysis.');
-
       const { job_id } = await res.json();
       setState({ phase: 'analyzing', stage: 'queued', jobId: job_id });
       startPolling(job_id);
@@ -58,12 +50,10 @@ export default function Home() {
 
   const startPolling = (jobId: string) => {
     if (pollingRef.current) clearInterval(pollingRef.current);
-
     pollingRef.current = setInterval(async () => {
       try {
         const res = await fetch(`/api/status/${jobId}`);
         const status = await res.json();
-
         if (status.status === 'complete') {
           clearInterval(pollingRef.current!);
           setState({ phase: 'results', data: status.data as AnalysisResult });
@@ -72,14 +62,10 @@ export default function Home() {
           setState({ phase: 'error', message: status.error || 'Analysis failed.' });
         } else {
           setState((prev) =>
-            prev.phase === 'analyzing'
-              ? { ...prev, stage: status.status as JobStage }
-              : prev
+            prev.phase === 'analyzing' ? { ...prev, stage: status.status as JobStage } : prev
           );
         }
-      } catch {
-        // transient network error — keep polling
-      }
+      } catch { /* transient — keep polling */ }
     }, 3000);
   };
 
@@ -98,7 +84,6 @@ export default function Home() {
       </div>
 
       <div className="relative z-10 container mx-auto px-4 py-16 max-w-5xl">
-        {/* Header */}
         <motion.header
           initial={{ opacity: 0, y: -24 }}
           animate={{ opacity: 1, y: 0 }}
@@ -106,7 +91,7 @@ export default function Home() {
           className="text-center mb-16"
         >
           <div className="inline-flex items-center gap-2 px-3 py-1.5 rounded-full border border-purple-400/20 bg-purple-500/10 text-purple-300 text-xs font-medium mb-6 tracking-wide uppercase">
-            In-silico neuroscience
+            In-silico neuroscience · TribeV2
           </div>
           <h1 className="text-5xl font-bold text-white mb-4 tracking-tight leading-tight">
             Cognitive Impact{' '}
@@ -115,32 +100,19 @@ export default function Home() {
             </span>
           </h1>
           <p className="text-gray-400 text-lg max-w-xl mx-auto leading-relaxed">
-            Upload a video or paste a URL to measure its visual, auditory, and linguistic
-            cognitive fingerprint.
+            Upload a video or paste a URL to measure its visual, auditory, and linguistic cognitive fingerprint.
           </p>
         </motion.header>
 
         <AnimatePresence mode="wait">
           {state.phase === 'idle' && (
-            <motion.div
-              key="idle"
-              initial={{ opacity: 0, y: 16 }}
-              animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0, y: -16 }}
-              transition={{ duration: 0.3 }}
-            >
+            <motion.div key="idle" initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -16 }} transition={{ duration: 0.3 }}>
               <UploadZone onFileUpload={handleFileUpload} onUrlSubmit={handleUrlSubmit} />
             </motion.div>
           )}
 
           {(state.phase === 'uploading' || state.phase === 'analyzing') && (
-            <motion.div
-              key="processing"
-              initial={{ opacity: 0, y: 16 }}
-              animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0, y: -16 }}
-              transition={{ duration: 0.3 }}
-            >
+            <motion.div key="processing" initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -16 }} transition={{ duration: 0.3 }}>
               <AnalyzingState
                 phase={state.phase}
                 progress={state.phase === 'uploading' ? state.progress : undefined}
@@ -150,35 +122,20 @@ export default function Home() {
           )}
 
           {state.phase === 'results' && (
-            <motion.div
-              key="results"
-              initial={{ opacity: 0, y: 16 }}
-              animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0, y: -16 }}
-              transition={{ duration: 0.3 }}
-            >
+            <motion.div key="results" initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -16 }} transition={{ duration: 0.3 }}>
               <ResultsDashboard data={state.data} onReset={handleReset} />
             </motion.div>
           )}
 
           {state.phase === 'error' && (
-            <motion.div
-              key="error"
-              initial={{ opacity: 0, scale: 0.96 }}
-              animate={{ opacity: 1, scale: 1 }}
-              exit={{ opacity: 0 }}
-              className="max-w-lg mx-auto text-center"
-            >
+            <motion.div key="error" initial={{ opacity: 0, scale: 0.96 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0 }} className="max-w-lg mx-auto text-center">
               <div className="glass rounded-2xl p-8">
                 <div className="w-12 h-12 rounded-full bg-red-500/10 flex items-center justify-center mx-auto mb-4">
                   <span className="text-red-400 text-xl">!</span>
                 </div>
                 <p className="text-red-400 mb-2 font-medium">Something went wrong</p>
                 <p className="text-gray-400 text-sm mb-6">{state.message}</p>
-                <button
-                  onClick={handleReset}
-                  className="px-6 py-2.5 bg-white/5 border border-white/10 rounded-xl text-white hover:bg-white/10 transition-colors text-sm"
-                >
+                <button onClick={handleReset} className="px-6 py-2.5 bg-white/5 border border-white/10 rounded-xl text-white hover:bg-white/10 transition-colors text-sm">
                   Try again
                 </button>
               </div>
