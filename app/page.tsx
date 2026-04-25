@@ -16,14 +16,22 @@ export default function Home() {
 
   const handleFileUpload = async (file: File, audience: AudienceId) => {
     setState({ phase: 'uploading', progress: 0 });
+    const abort = new AbortController();
+    const timer = setTimeout(() => abort.abort(), 90_000);
     try {
       const blob = await upload(file.name, file, {
         access: 'public',
         handleUploadUrl: '/api/upload',
+        abortSignal: abort.signal,
       });
+      clearTimeout(timer);
       await startAnalysis(blob.url, audience);
     } catch (err) {
-      setState({ phase: 'error', message: (err as Error).message || 'Upload failed.' });
+      clearTimeout(timer);
+      const msg = (err as Error).name === 'AbortError'
+        ? 'Upload timed out. Try a smaller file or use the URL tab instead.'
+        : (err as Error).message || 'Upload failed.';
+      setState({ phase: 'error', message: msg });
     }
   };
 
