@@ -14,6 +14,13 @@ app = modal.App("cognitive-analyzer")
 
 job_store = modal.Dict.from_name("cognitive-analyzer-jobs", create_if_missing=True)
 
+
+def _compute_verdict(score: int) -> str:
+    if score >= 80: return "Critical Cognitive Load"
+    if score >= 65: return "High Cognitive Impact"
+    if score >= 45: return "Moderate Cognitive Demand"
+    return "Low Cognitive Load"
+
 endpoint_image = (
     modal.Image.debian_slim(python_version="3.11")
     .pip_install(["fastapi[standard]", "pydantic"])
@@ -62,6 +69,17 @@ def _activations_to_score(arr) -> int:
     mean_act = float(np.mean(np.abs(arr)))
     p95 = float(np.percentile(np.abs(arr), 95)) + 1e-8
     return min(100, int((mean_act / p95) * 100))
+
+
+def _score_with_ci(arr) -> tuple[int, dict]:
+    """Return (score 0-100, {"low": int, "high": int}) from activation array (n_timesteps, n_vertices)."""
+    import numpy as np
+    frame_means = np.mean(np.abs(arr), axis=1)
+    p95 = np.percentile(frame_means, 95) + 1e-8
+    normed = np.clip(frame_means / p95, 0, 1) * 100
+    score = min(100, int(np.mean(normed)))
+    spread = max(5, min(15, int(np.std(normed) * 0.5)))
+    return score, {"low": max(0, score - spread), "high": min(100, score + spread)}
 
 
 # ── Frame extraction ──────────────────────────────────────────────────────────
@@ -244,7 +262,7 @@ def build_temporal_data(preds, duration: float) -> list[dict]:
         modal.Secret.from_name("anthropic-secret"),
     ],
 )
-def run_analysis(job_id: str, video_url: str) -> None:
+def run_analysis(job_id: str, video_url: str, audience: str = "all") -> None:
     import os
     import json
     import subprocess
@@ -292,7 +310,13 @@ def run_analysis(job_id: str, video_url: str) -> None:
 
         _set(job_id, {"status": "aggregating"})
 
-        # ── Aggregate scores ──────────────────────────────────────────────────
+        # ── Aggregate scores + confidence bands ───────────────────────────────
+        import numpy as np
+        n_v = preds.shape[1]
+        vis_arr = preds[:, :n_v // 3]
+        aud_arr = preds[:, n_v // 3: 2 * n_v // 3]
+        lin_arr = preds[:, 2 * n_v // 3:]
+
         try:
             from cortexlab.analysis import CognitiveLoadScorer
             scorer = CognitiveLoadScorer()
@@ -300,14 +324,19 @@ def run_analysis(job_id: str, video_url: str) -> None:
             visual_load         = min(100, int(scores["visual_complexity"]   * 100))
             auditory_engagement = min(100, int(scores["auditory_demand"]     * 100))
             linguistic_impact   = min(100, int(scores["language_processing"] * 100))
+            _, vis_ci = _score_with_ci(vis_arr)
+            _, aud_ci = _score_with_ci(aud_arr)
+            _, lin_ci = _score_with_ci(lin_arr)
         except Exception:
-            import numpy as np
-            n_v = preds.shape[1]
-            visual_load         = _activations_to_score(preds[:, :n_v // 3])
-            auditory_engagement = _activations_to_score(preds[:, n_v // 3: 2 * n_v // 3])
-            linguistic_impact   = _activations_to_score(preds[:, 2 * n_v // 3:])
+            visual_load,         vis_ci = _score_with_ci(vis_arr)
+            auditory_engagement, aud_ci = _score_with_ci(aud_arr)
+            linguistic_impact,   lin_ci = _score_with_ci(lin_arr)
 
         overall = (visual_load + auditory_engagement + linguistic_impact) // 3
+        overall_ci = {
+            "low":  (vis_ci["low"]  + aud_ci["low"]  + lin_ci["low"])  // 3,
+            "high": (vis_ci["high"] + aud_ci["high"] + lin_ci["high"]) // 3,
+        }
 
         # ── Temporal activation data ──────────────────────────────────────────
         temporal_data = build_temporal_data(preds, duration)
@@ -322,8 +351,16 @@ def run_analysis(job_id: str, video_url: str) -> None:
                 "auditoryEngagement":   auditory_engagement,
                 "linguisticImpact":     linguistic_impact,
                 "overallCognitiveLoad": overall,
+                "verdict":              _compute_verdict(overall),
+                "audience":             audience,
                 "summary":              _build_summary(visual_load, auditory_engagement, linguistic_impact),
                 "processingTimeSeconds":round(time.time() - start, 1),
+                "confidence": {
+                    "visualLoad":           vis_ci,
+                    "auditoryEngagement":   aud_ci,
+                    "linguisticImpact":     lin_ci,
+                    "overallCognitiveLoad": overall_ci,
+                },
                 "temporalData":         temporal_data,
                 "moments":              moments,
             },
@@ -346,6 +383,7 @@ def _build_summary(visual: int, auditory: int, linguistic: int) -> str:
 
 class AnalyzeRequest(BaseModel):
     video_url: str
+    audience: str = "all"
 
 
 @app.function(image=endpoint_image)
@@ -353,7 +391,7 @@ class AnalyzeRequest(BaseModel):
 def start_analysis(req: AnalyzeRequest) -> dict:
     job_id = str(uuid.uuid4())
     _set(job_id, {"status": "queued"})
-    run_analysis.spawn(job_id, req.video_url)
+    run_analysis.spawn(job_id, req.video_url, req.audience)
     return {"job_id": job_id, "status": "queued"}
 
 
