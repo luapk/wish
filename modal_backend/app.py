@@ -270,101 +270,106 @@ def run_analysis(job_id: str, video_url: str, audience: str = "all") -> None:
     import urllib.request
 
     start = time.time()
-    _set(job_id, {"status": "downloading"})
 
-    with tempfile.TemporaryDirectory() as tmp:
-        video_path = os.path.join(tmp, "video.mp4")
+    try:
+        _set(job_id, {"status": "downloading"})
 
-        if any(h in video_url for h in ["youtube.com", "youtu.be", "vimeo.com"]):
-            subprocess.run(
-                ["yt-dlp", "-f", "best[ext=mp4]/best", "--max-filesize", "100m",
-                 "-o", video_path, video_url],
-                check=True,
+        with tempfile.TemporaryDirectory() as tmp:
+            video_path = os.path.join(tmp, "video.mp4")
+
+            # ── Download ──────────────────────────────────────────────────────
+            if any(h in video_url for h in ["youtube.com", "youtu.be", "vimeo.com"]):
+                result = subprocess.run(
+                    ["yt-dlp", "--update-to", "stable",
+                     "-f", "best[ext=mp4]/best", "--max-filesize", "100m",
+                     "-o", video_path, video_url],
+                    capture_output=True, text=True,
+                )
+                if result.returncode != 0:
+                    raise RuntimeError(f"yt-dlp failed: {result.stderr[-500:]}")
+            else:
+                urllib.request.urlretrieve(video_url, video_path)
+
+            # ── Probe duration ────────────────────────────────────────────────
+            probe = subprocess.run(
+                ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", video_path],
+                capture_output=True, text=True
             )
-        else:
-            urllib.request.urlretrieve(video_url, video_path)
+            duration = float(json.loads(probe.stdout).get("format", {}).get("duration", 60))
 
-        # Get video duration
-        probe = subprocess.run(
-            ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", video_path],
-            capture_output=True, text=True
-        )
-        duration = float(json.loads(probe.stdout).get("format", {}).get("duration", 60))
+            _set(job_id, {"status": "extracting_frames"})
+            keyframes = extract_keyframes(video_path, max_frames=20)
 
-        _set(job_id, {"status": "extracting_frames"})
+            # ── TribeV2 inference ─────────────────────────────────────────────
+            _set(job_id, {"status": "running_inference"})
 
-        # Extract keyframes for vision analysis (runs in parallel with inference)
-        keyframes = extract_keyframes(video_path, max_frames=20)
+            from tribev2 import TribeModel
+            model = TribeModel.from_pretrained(
+                "facebook/tribev2",
+                token=os.environ["HUGGINGFACE_TOKEN"],
+                cache_folder="/tmp/tribev2_cache",
+            )
+            df    = model.get_events_dataframe(video_path=video_path)
+            preds, _ = model.predict(events=df)
 
-        # ── TribeV2 inference ─────────────────────────────────────────────────
-        _set(job_id, {"status": "running_inference"})
+            _set(job_id, {"status": "aggregating"})
 
-        from tribev2 import TribeModel
-        model = TribeModel.from_pretrained(
-            "facebook/tribev2",
-            token=os.environ["HUGGINGFACE_TOKEN"],
-            cache_folder="/tmp/tribev2_cache",
-        )
-        df   = model.get_events_dataframe(video_path=video_path)
-        preds, _ = model.predict(events=df)
+            # ── Scores + confidence bands ─────────────────────────────────────
+            import numpy as np
+            n_v     = preds.shape[1]
+            vis_arr = preds[:, :n_v // 3]
+            aud_arr = preds[:, n_v // 3: 2 * n_v // 3]
+            lin_arr = preds[:, 2 * n_v // 3:]
 
-        _set(job_id, {"status": "aggregating"})
+            try:
+                from cortexlab.analysis import CognitiveLoadScorer
+                scorer = CognitiveLoadScorer()
+                scores = scorer.score_predictions(preds)
+                visual_load         = min(100, int(scores["visual_complexity"]   * 100))
+                auditory_engagement = min(100, int(scores["auditory_demand"]     * 100))
+                linguistic_impact   = min(100, int(scores["language_processing"] * 100))
+                _, vis_ci = _score_with_ci(vis_arr)
+                _, aud_ci = _score_with_ci(aud_arr)
+                _, lin_ci = _score_with_ci(lin_arr)
+            except Exception:
+                visual_load,         vis_ci = _score_with_ci(vis_arr)
+                auditory_engagement, aud_ci = _score_with_ci(aud_arr)
+                linguistic_impact,   lin_ci = _score_with_ci(lin_arr)
 
-        # ── Aggregate scores + confidence bands ───────────────────────────────
-        import numpy as np
-        n_v = preds.shape[1]
-        vis_arr = preds[:, :n_v // 3]
-        aud_arr = preds[:, n_v // 3: 2 * n_v // 3]
-        lin_arr = preds[:, 2 * n_v // 3:]
+            overall    = (visual_load + auditory_engagement + linguistic_impact) // 3
+            overall_ci = {
+                "low":  (vis_ci["low"]  + aud_ci["low"]  + lin_ci["low"])  // 3,
+                "high": (vis_ci["high"] + aud_ci["high"] + lin_ci["high"]) // 3,
+            }
 
-        try:
-            from cortexlab.analysis import CognitiveLoadScorer
-            scorer = CognitiveLoadScorer()
-            scores = scorer.score_predictions(preds)
-            visual_load         = min(100, int(scores["visual_complexity"]   * 100))
-            auditory_engagement = min(100, int(scores["auditory_demand"]     * 100))
-            linguistic_impact   = min(100, int(scores["language_processing"] * 100))
-            _, vis_ci = _score_with_ci(vis_arr)
-            _, aud_ci = _score_with_ci(aud_arr)
-            _, lin_ci = _score_with_ci(lin_arr)
-        except Exception:
-            visual_load,         vis_ci = _score_with_ci(vis_arr)
-            auditory_engagement, aud_ci = _score_with_ci(aud_arr)
-            linguistic_impact,   lin_ci = _score_with_ci(lin_arr)
+            temporal_data = build_temporal_data(preds, duration)
+            moments       = detect_moments_with_vision(keyframes, duration)
 
-        overall = (visual_load + auditory_engagement + linguistic_impact) // 3
-        overall_ci = {
-            "low":  (vis_ci["low"]  + aud_ci["low"]  + lin_ci["low"])  // 3,
-            "high": (vis_ci["high"] + aud_ci["high"] + lin_ci["high"]) // 3,
-        }
-
-        # ── Temporal activation data ──────────────────────────────────────────
-        temporal_data = build_temporal_data(preds, duration)
-
-        # ── Vision-based contextual moments ──────────────────────────────────
-        moments = detect_moments_with_vision(keyframes, duration)
-
-        _set(job_id, {
-            "status": "complete",
-            "data": {
-                "visualLoad":           visual_load,
-                "auditoryEngagement":   auditory_engagement,
-                "linguisticImpact":     linguistic_impact,
-                "overallCognitiveLoad": overall,
-                "verdict":              _compute_verdict(overall),
-                "audience":             audience,
-                "summary":              _build_summary(visual_load, auditory_engagement, linguistic_impact),
-                "processingTimeSeconds":round(time.time() - start, 1),
-                "confidence": {
-                    "visualLoad":           vis_ci,
-                    "auditoryEngagement":   aud_ci,
-                    "linguisticImpact":     lin_ci,
-                    "overallCognitiveLoad": overall_ci,
+            _set(job_id, {
+                "status": "complete",
+                "data": {
+                    "visualLoad":           visual_load,
+                    "auditoryEngagement":   auditory_engagement,
+                    "linguisticImpact":     linguistic_impact,
+                    "overallCognitiveLoad": overall,
+                    "verdict":              _compute_verdict(overall),
+                    "audience":             audience,
+                    "summary":              _build_summary(visual_load, auditory_engagement, linguistic_impact),
+                    "processingTimeSeconds":round(time.time() - start, 1),
+                    "confidence": {
+                        "visualLoad":           vis_ci,
+                        "auditoryEngagement":   aud_ci,
+                        "linguisticImpact":     lin_ci,
+                        "overallCognitiveLoad": overall_ci,
+                    },
+                    "temporalData": temporal_data,
+                    "moments":      moments,
                 },
-                "temporalData":         temporal_data,
-                "moments":              moments,
-            },
-        })
+            })
+
+    except Exception as exc:
+        _set(job_id, {"status": "error", "error": str(exc)})
+        raise
 
 
 def _build_summary(visual: int, auditory: int, linguistic: int) -> str:
