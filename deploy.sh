@@ -11,18 +11,19 @@ ANTHROPIC_API_KEY="YOUR_ANTHROPIC_API_KEY"
 HUGGINGFACE_TOKEN="YOUR_HUGGINGFACE_TOKEN"
 
 echo "==> Installing Modal CLI..."
-PIP=$(command -v pip3 || command -v pip || echo "python3 -m pip")
-$PIP install modal -q
+python3 -m pip install modal -q
+
+MODAL="python3 -m modal"
 
 echo "==> Authenticating Modal..."
-modal token set --token-id "$MODAL_TOKEN_ID" --token-secret "$MODAL_TOKEN_SECRET"
+$MODAL token set --token-id "$MODAL_TOKEN_ID" --token-secret "$MODAL_TOKEN_SECRET"
 
 echo "==> Creating Modal secrets..."
-modal secret create anthropic-secret ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY" --force
-modal secret create huggingface-secret HUGGINGFACE_TOKEN="$HUGGINGFACE_TOKEN" --force
+$MODAL secret create anthropic-secret ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY" --force
+$MODAL secret create huggingface-secret HUGGINGFACE_TOKEN="$HUGGINGFACE_TOKEN" --force
 
 echo "==> Deploying Modal backend (builds Docker image — ~3 min first time)..."
-modal deploy modal_backend/app.py
+$MODAL deploy modal_backend/app.py
 
 echo ""
 echo "=========================================================="
