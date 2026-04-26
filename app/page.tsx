@@ -2,7 +2,6 @@
 
 import { useState, useEffect, useRef } from 'react';
 import { AnimatePresence, motion } from 'framer-motion';
-import { upload } from '@vercel/blob/client';
 import UploadZone from '@/components/UploadZone';
 import AnalyzingState from '@/components/AnalyzingState';
 import ResultsDashboard from '@/components/ResultsDashboard';
@@ -18,15 +17,20 @@ export default function Home() {
   const handleFileUpload = async (file: File, audience: AudienceId) => {
     setState({ phase: 'uploading', progress: 0 });
     const abort = new AbortController();
-    const timer = setTimeout(() => abort.abort(), 90_000);
+    const timer = setTimeout(() => abort.abort(), 120_000);
     try {
-      const blob = await upload(file.name, file, {
-        access: 'public',
-        handleUploadUrl: '/api/upload',
-        abortSignal: abort.signal,
+      const res = await fetch(`/api/upload?filename=${encodeURIComponent(file.name)}`, {
+        method: 'POST',
+        body: file,
+        signal: abort.signal,
       });
       clearTimeout(timer);
-      await startAnalysis(blob.url, audience);
+      if (!res.ok) {
+        const { error } = await res.json().catch(() => ({ error: 'Upload failed.' }));
+        throw new Error(error);
+      }
+      const { url } = await res.json();
+      await startAnalysis(url, audience);
     } catch (err) {
       clearTimeout(timer);
       const msg = (err as Error).name === 'AbortError'
