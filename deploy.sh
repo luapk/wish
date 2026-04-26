@@ -11,7 +11,8 @@ ANTHROPIC_API_KEY="YOUR_ANTHROPIC_API_KEY"
 HUGGINGFACE_TOKEN="YOUR_HUGGINGFACE_TOKEN"
 
 echo "==> Installing Modal CLI..."
-pip install modal -q
+PIP=$(command -v pip3 || command -v pip || echo "python3 -m pip")
+$PIP install modal -q
 
 echo "==> Authenticating Modal..."
 modal token set --token-id "$MODAL_TOKEN_ID" --token-secret "$MODAL_TOKEN_SECRET"
