@@ -1,26 +1,22 @@
-import { put } from '@vercel/blob';
+import { handleUpload, type HandleUploadBody } from '@vercel/blob/client';
 import { NextResponse } from 'next/server';
 
-export const maxDuration = 60;
-
 export async function POST(request: Request): Promise<NextResponse> {
-  const { searchParams } = new URL(request.url);
-  const filename = searchParams.get('filename') ?? 'video.mp4';
-
-  const contentType = request.headers.get('content-type') ?? '';
-  const allowed = ['video/mp4', 'video/quicktime', 'video/webm', 'video/x-msvideo'];
-  if (!allowed.some(t => contentType.startsWith(t))) {
-    return NextResponse.json({ error: 'Unsupported file type.' }, { status: 400 });
-  }
-
-  if (!request.body) {
-    return NextResponse.json({ error: 'No file body.' }, { status: 400 });
-  }
-
+  const body = (await request.json()) as HandleUploadBody;
   try {
-    const blob = await put(filename, request.body, { access: 'public' });
-    return NextResponse.json({ url: blob.url });
+    const json = await handleUpload({
+      body,
+      request,
+      onBeforeGenerateToken: async () => ({
+        allowedContentTypes: ['video/mp4', 'video/quicktime', 'video/webm'],
+        maximumSizeInBytes: 50 * 1024 * 1024,
+      }),
+      onUploadCompleted: async ({ blob }) => {
+        console.log('Upload completed:', blob.url);
+      },
+    });
+    return NextResponse.json(json);
   } catch (err) {
-    return NextResponse.json({ error: (err as Error).message }, { status: 500 });
+    return NextResponse.json({ error: (err as Error).message }, { status: 400 });
   }
 }
